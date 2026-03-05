@@ -87,7 +87,7 @@ def _build_extraction_providers(settings: Settings) -> list[ExtractionProvider]:
             )
         return [GeminiExtractionProvider(api_key=settings.gemini_api_key)]
 
-    return [LocalPdfExtractionProvider()]
+    return [LocalPdfExtractionProvider(ocr_backend=settings.ocr_backend)]
 
 
 def _build_chunking_providers() -> list[ChunkingProvider]:

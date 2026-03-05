@@ -21,6 +21,95 @@ ErrorClass = Literal[
     "permanent_unsupported",
 ]
 
+
+def _run_ocr_fallback(path: Path, ocr_backend: str) -> str | None:
+    """Attempt OCR on a PDF that produced no extractable text.
+
+    Returns the extracted text, or None if OCR is unavailable or fails.
+    Does NOT modify the original PDF – works on a temporary copy.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    if ocr_backend == "none":
+        return None
+
+    if ocr_backend == "ocrmypdf":
+        if shutil.which("ocrmypdf") is None:
+            logger.warning("OCR_BACKEND=ocrmypdf but ocrmypdf is not installed")
+            return None
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            # Detect available Tesseract languages
+            lang_result = subprocess.run(
+                ["tesseract", "--list-langs"],
+                capture_output=True, text=True, timeout=10,
+            )
+            available_langs = set(lang_result.stdout.strip().splitlines()[1:])  # skip header
+            lang_parts = []
+            for lang in ["eng", "deu", "fra"]:
+                if lang in available_langs:
+                    lang_parts.append(lang)
+            ocr_lang = "+".join(lang_parts) if lang_parts else "eng"
+
+            result = subprocess.run(
+                ["ocrmypdf", "--force-ocr", "-l", ocr_lang,
+                 "-j", "1",  # single-threaded to avoid race conditions
+                 str(path), str(tmp_path)],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                logger.warning("ocrmypdf failed (exit %d): %s", result.returncode, result.stderr[:500])
+                return None
+            import fitz
+            doc = fitz.open(str(tmp_path))
+            try:
+                pages = [page.get_text("text") or "" for page in doc]
+            finally:
+                doc.close()
+            text = "\n\n".join(pages).strip()
+            return text if text else None
+        except subprocess.TimeoutExpired:
+            logger.warning("ocrmypdf timed out for %s", path)
+            return None
+        except Exception as exc:
+            logger.warning("ocrmypdf error for %s: %s", path, exc)
+            return None
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    if ocr_backend == "abbyy":
+        # ABBYY FineReader CLI (macOS: /Applications/ABBYY FineReader.app/...)
+        abbyy_cmd = shutil.which("abbyyocr11") or shutil.which("AbbyyOCR")
+        if abbyy_cmd is None:
+            logger.warning("OCR_BACKEND=abbyy but no ABBYY CLI found on PATH")
+            return None
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            result = subprocess.run(
+                [abbyy_cmd, "-rl", "German,English", "-if", str(path),
+                 "-of", str(tmp_path), "-f", "TextUnicodeDefaults"],
+                capture_output=True, text=True, timeout=600,
+            )
+            if result.returncode != 0:
+                logger.warning("ABBYY failed (exit %d): %s", result.returncode, result.stderr[:500])
+                return None
+            text = tmp_path.read_text(encoding="utf-8", errors="replace").strip()
+            return text if text else None
+        except subprocess.TimeoutExpired:
+            logger.warning("ABBYY timed out for %s", path)
+            return None
+        except Exception as exc:
+            logger.warning("ABBYY error for %s: %s", path, exc)
+            return None
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    return None
+
 PDF_MIME_TYPE = "application/pdf"
 SUPPORTED_EXTRACTION_MIME_TYPES = frozenset({PDF_MIME_TYPE})
 logger = logging.getLogger(__name__)
@@ -225,6 +314,7 @@ class LocalPdfExtractionProvider:
     name: str = "local"
     version: str = "pymupdf+trafilatura"
     supported_mime_types: frozenset[str] = frozenset({PDF_MIME_TYPE})
+    ocr_backend: str = "none"
 
     def extract(
         self,
@@ -266,6 +356,16 @@ class LocalPdfExtractionProvider:
 
         raw_text = "\n\n".join(raw_pages)
         if not raw_text.strip():
+            # Attempt OCR fallback for scanned PDFs
+            ocr_text = _run_ocr_fallback(path, self.ocr_backend)
+            if ocr_text:
+                logger.info("OCR fallback succeeded for %s (%s)", path, self.ocr_backend)
+                normalized_text = _normalize_extracted_text(ocr_text)
+                if normalized_text.strip():
+                    return ExtractionResult(
+                        text=normalized_text,
+                        metadata={"mode": f"ocr_{self.ocr_backend}", "normalized": True},
+                    )
             raise ValueError(f"Extraction produced empty text for {path}")
 
         normalized_pages = [_normalize_extracted_text(page) for page in raw_pages]

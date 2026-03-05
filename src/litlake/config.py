@@ -55,6 +55,7 @@ class Settings:
     queue_backoff_base_seconds: int
     queue_backoff_max_seconds: int
     extraction_backend: str
+    ocr_backend: str
     gemini_api_key: str | None
     zotero_db_path: str | None
 
@@ -95,6 +96,10 @@ def load_settings() -> Settings:
     if extraction_backend not in {"local", "gemini"}:
         extraction_backend = "local"
 
+    ocr_backend = (_clean_env(os.getenv("OCR_BACKEND")) or "none").lower()
+    if ocr_backend not in {"none", "ocrmypdf", "abbyy"}:
+        ocr_backend = "none"
+
     return Settings(
         paths=paths,
         worker_id=worker_id,
@@ -105,6 +110,7 @@ def load_settings() -> Settings:
         queue_backoff_base_seconds=_env_int("QUEUE_BACKOFF_BASE_SECONDS", default=5, minimum=1),
         queue_backoff_max_seconds=_env_int("QUEUE_BACKOFF_MAX_SECONDS", default=900, minimum=5),
         extraction_backend=extraction_backend,
+        ocr_backend=ocr_backend,
         gemini_api_key=_clean_env(os.getenv("GEMINI_API_KEY")),
         zotero_db_path=_clean_env(os.getenv("ZOTERO_DB_PATH")),
     )
