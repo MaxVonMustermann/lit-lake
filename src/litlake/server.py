@@ -803,3 +803,86 @@ def annotate_quotes(
     return CallToolResult(
         content=[TextContent(type="text", text="\n".join(results))]
     )
+
+
+@mcp.tool(
+    name="ocr_scanned_pdfs",
+    description=(
+        "Run OCR on all PDFs in the library that failed text extraction (scanned documents). "
+        "Requires OCR_BACKEND to be set to 'ocrmypdf' or 'abbyy'. "
+        "Writes an invisible text layer into each PDF so it becomes searchable and "
+        "highlightable in Zotero. After OCR, resets extraction status to 'pending' so "
+        "the normal pipeline picks up the text. Returns a summary of results."
+    ),
+    annotations=ToolAnnotations(title="OCR Scanned PDFs", readOnlyHint=False, destructiveHint=False),
+)
+def ocr_scanned_pdfs(ctx: Context) -> str:
+    from litlake.providers.extraction import _run_ocr_fallback
+
+    state = _state(ctx)
+    ocr_backend = state.settings.ocr_backend
+
+    if ocr_backend == "none":
+        return (
+            "OCR is disabled. Set the OCR_BACKEND environment variable to 'ocrmypdf' or 'abbyy' "
+            "in your Claude config or .env file, then restart."
+        )
+
+    with state.conn_lock:
+        failed_rows = state.conn.execute(
+            """
+            SELECT df.id, df.file_path, r.title
+            FROM document_files df
+            JOIN reference_items r ON r.id = df.reference_id
+            WHERE df.mime_type = 'application/pdf'
+              AND (df.extracted_text IS NULL OR TRIM(df.extracted_text) = '')
+              AND df.id IN (
+                  SELECT entity_id FROM jobs
+                  WHERE queue_name = 'extraction'
+                  AND status IN ('dead', 'failed')
+                  AND entity_type = 'document_file'
+              )
+            """
+        ).fetchall()
+
+    if not failed_rows:
+        return "No failed PDF extractions found. All PDFs already have text."
+
+    results: list[str] = []
+    success_ids: list[int] = []
+
+    for file_id, file_path, title in failed_rows:
+        from pathlib import Path
+        path = Path(file_path)
+        if not path.exists():
+            results.append(f"\u274c {title[:60]} — file not found")
+            continue
+
+        text = _run_ocr_fallback(path, ocr_backend)
+        if text:
+            results.append(f"\u2705 {title[:60]} — {len(text)} chars extracted")
+            success_ids.append(int(file_id))
+        else:
+            results.append(f"\u274c {title[:60]} — OCR returned no text")
+
+    # Reset extraction status for successful OCR so the pipeline re-extracts
+    if success_ids:
+        with state.conn_lock:
+            placeholders = ",".join("?" for _ in success_ids)
+            state.conn.execute(
+                f"""
+                UPDATE document_files
+                SET extraction_status = 'pending',
+                    extraction_error = NULL,
+                    extracted_text = NULL
+                WHERE id IN ({placeholders})
+                """,
+                success_ids,
+            )
+            state.conn.execute("COMMIT")
+
+        if state.extraction_worker is not None:
+            state.extraction_worker.wake()
+
+    header = f"OCR complete ({ocr_backend}): {len(success_ids)}/{len(failed_rows)} PDFs processed successfully."
+    return header + "\n\n" + "\n".join(results)

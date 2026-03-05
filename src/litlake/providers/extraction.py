@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import os
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -26,7 +27,8 @@ def _run_ocr_fallback(path: Path, ocr_backend: str) -> str | None:
     """Attempt OCR on a PDF that produced no extractable text.
 
     Returns the extracted text, or None if OCR is unavailable or fails.
-    Does NOT modify the original PDF – works on a temporary copy.
+    Writes the OCR layer back into the original PDF so it becomes
+    searchable and highlightable in Zotero and other PDF viewers.
     """
     import shutil
     import subprocess
@@ -39,8 +41,10 @@ def _run_ocr_fallback(path: Path, ocr_backend: str) -> str | None:
         if shutil.which("ocrmypdf") is None:
             logger.warning("OCR_BACKEND=ocrmypdf but ocrmypdf is not installed")
             return None
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+        # Use home directory for temp files – macOS sandbox blocks /tmp for Tesseract
+        ocr_tmp_dir = Path.home() / ".litlake_ocr_tmp"
+        ocr_tmp_dir.mkdir(exist_ok=True)
+        tmp_path = ocr_tmp_dir / f"ocr_{os.getpid()}.pdf"
         try:
             # Detect available Tesseract languages
             lang_result = subprocess.run(
@@ -54,15 +58,22 @@ def _run_ocr_fallback(path: Path, ocr_backend: str) -> str | None:
                     lang_parts.append(lang)
             ocr_lang = "+".join(lang_parts) if lang_parts else "eng"
 
+            # Set TMPDIR to home-based dir so Tesseract can access temp files
+            # (macOS sandbox blocks /tmp for Homebrew Tesseract)
+            ocr_env = os.environ.copy()
+            ocr_env["TMPDIR"] = str(ocr_tmp_dir)
             result = subprocess.run(
                 ["ocrmypdf", "--force-ocr", "-l", ocr_lang,
                  "-j", "1",  # single-threaded to avoid race conditions
                  str(path), str(tmp_path)],
                 capture_output=True, text=True, timeout=300,
+                env=ocr_env,
             )
             if result.returncode != 0:
                 logger.warning("ocrmypdf failed (exit %d): %s", result.returncode, result.stderr[:500])
                 return None
+
+            # Read text from the OCR'd PDF
             import fitz
             doc = fitz.open(str(tmp_path))
             try:
@@ -70,7 +81,13 @@ def _run_ocr_fallback(path: Path, ocr_backend: str) -> str | None:
             finally:
                 doc.close()
             text = "\n\n".join(pages).strip()
-            return text if text else None
+            if not text:
+                return None
+
+            # Replace original with OCR'd version so it's searchable in Zotero
+            shutil.copy2(str(tmp_path), str(path))
+            logger.info("OCR layer written back to original PDF: %s", path)
+            return text
         except subprocess.TimeoutExpired:
             logger.warning("ocrmypdf timed out for %s", path)
             return None
@@ -86,8 +103,9 @@ def _run_ocr_fallback(path: Path, ocr_backend: str) -> str | None:
         if abbyy_cmd is None:
             logger.warning("OCR_BACKEND=abbyy but no ABBYY CLI found on PATH")
             return None
-        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+        ocr_tmp_dir = Path.home() / ".litlake_ocr_tmp"
+        ocr_tmp_dir.mkdir(exist_ok=True)
+        tmp_path = ocr_tmp_dir / f"ocr_{os.getpid()}.txt"
         try:
             result = subprocess.run(
                 [abbyy_cmd, "-rl", "German,English", "-if", str(path),
